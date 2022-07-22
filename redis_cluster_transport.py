@@ -1,463 +1,413 @@
-# -*- coding: utf-8 -*-
-"""
-    celery.backends.rediscluster
-    ~~~~~~~~~~~~~~~~~~~~~
-    Redis cluster result store backend.
-    CELERY_REDIS_CLUSTER_BACKEND_SETTINGS = {
-        startup_nodes: [{"host": "127.0.0.1", "port": "7000"}]
-    }
-"""
-from __future__ import absolute_import
+from time import time
 
-from functools import partial
-
-from kombu.utils import cached_property, retry_over_time
-import time
-from contextlib import contextmanager
-from celery import states
-from celery._state import task_join_will_block
-from celery.canvas import maybe_signature
-from celery.exceptions import ChordError, ImproperlyConfigured
-from celery.utils.serialization import strtobool
-from celery.utils.log import get_logger
-from celery.utils.time import humanize_seconds
+from queue import Empty
+from kombu.utils.compat import _detect_environment
+from kombu.utils.encoding import bytes_to_str
+from kombu.utils.eventio import READ, ERR
+from kombu.utils.json import loads
+from kombu.log import get_logger
+from kombu.utils.functional import accepts_argument
 from kombu.utils.url import _parse_url
-from celery.utils.functional import dictfilter
-from ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED
-from urllib.parse import unquote
-from redis import connection
-
-from celery.backends.base import KeyValueStoreBackend
-from celery.backends.asynchronous import BaseResultConsumer
-
-# try:
-from redis.cluster import RedisCluster
-
-# from kombu.transport.redis import get_redis_error_classes
-# except ImportError:                 # pragma: no cover
-#    RedisCluster = None                    # noqa
-#    ConnectionError = None          # noqa
-get_redis_error_classes = None  # noqa
-
-__all__ = ['RedisClusterBackend']
-
-E_REDIS_MISSING = """\
-You need to install the redis-py-cluster library in order to use \
-the Redis result store backend."""
-
-W_REDIS_SSL_CERT_OPTIONAL = """
-Setting ssl_cert_reqs=CERT_OPTIONAL when connecting to redis means that \
-celery might not validate the identity of the redis broker when connecting. \
-This leaves you vulnerable to man in the middle attacks.
-"""
-
-W_REDIS_SSL_CERT_NONE = """
-Setting ssl_cert_reqs=CERT_NONE when connecting to redis means that celery \
-will not validate the identity of the redis broker when connecting. This \
-leaves you vulnerable to man in the middle attacks.
-"""
-
-E_REDIS_SSL_PARAMS_AND_SCHEME_MISMATCH = """
-SSL connection parameters have been provided but the specified URL scheme \
-is rediss:// or cluster-redis://. A Redis SSL connection URL should use the scheme rediss:// or cluster-rediss://.
-"""
-
-E_REDIS_SSL_CERT_REQS_MISSING_INVALID = """
-A rediss:// or cluster-rediss:// URL must have parameter ssl_cert_reqs and this must be set to \
-CERT_REQUIRED, CERT_OPTIONAL, or CERT_NONE
-"""
-
-E_LOST = 'Connection to Redis lost: Retry (%s/%s) %s.'
+from kombu.transport.redis import (
+    Channel as RedisChannel,
+    MultiChannelPoller,
+    Mutex,
+    MutexHeld,
+    QoS as RedisQoS,
+    Transport as RedisTransport,
+)
+import redis
+try:
+    from redis.connection import (
+        Connection,
+        SSLConnection,
+    )
+    from redis.exceptions import MovedError
+    import redis.cluster as rediscluster
+except ImportError:
+    rediscluster = None
 
 
-E_RETRY_LIMIT_EXCEEDED = """
-Retry limit exceeded while trying to reconnect to the Celery redis result \
-store backend. The Celery application must be restarted.
-"""
+logger = get_logger('ai_bus_commons.celery.redis_cluster_transport')
+crit, warn = logger.critical, logger.warn
 
 
-logger = get_logger(__name__)
-error = logger.error
+class QoS(RedisQoS):
 
+    def restore_visible(self, start=0, num=10, interval=10):
+        self._vrestore_count += 1
+        if (self._vrestore_count - 1) % interval:
+            return
+        with self.channel.conn_or_acquire() as client:
+            ceil = time() - self.visibility_timeout
 
-class ResultConsumer(BaseResultConsumer):
-    _pubsub = None
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._get_key_for_task = self.backend.get_key_for_task
-        self._decode_result = self.backend.decode_result
-        self._ensure = self.backend.ensure
-        self._connection_errors = self.backend.connection_errors
-        self.subscribed_to = set()
-
-    def on_after_fork(self):
-        try:
-            self.backend.client.connection_pool.reset()
-            if self._pubsub is not None:
-                self._pubsub.close()
-        except KeyError as e:
-            logger.warning(str(e))
-        super().on_after_fork()
-
-    def _reconnect_pubsub(self):
-        self._pubsub = None
-        self.backend.client.connection_pool.reset()
-        # task state might have changed when the connection was down so we
-        # retrieve meta for all subscribed tasks before going into pubsub mode
-        if self.subscribed_to:
-            metas = self.backend.client.mget(self.subscribed_to)
-            metas = [meta for meta in metas if meta]
-            for meta in metas:
-                self.on_state_change(self._decode_result(meta), None)
-        self._pubsub = self.backend.client.pubsub(
-            ignore_subscribe_messages=True,
-        )
-        # subscribed_to maybe empty after on_state_change
-        if self.subscribed_to:
-            self._pubsub.subscribe(*self.subscribed_to)
-        else:
-            self._pubsub.connection = self._pubsub.connection_pool.get_connection(
-                'pubsub', self._pubsub.shard_hint
-            )
-            # even if there is nothing to subscribe, we should not lose the callback after connecting.
-            # The on_connect callback will re-subscribe to any channels we previously subscribed to.
-            self._pubsub.connection.register_connect_callback(self._pubsub.on_connect)
-
-    @contextmanager
-    def reconnect_on_error(self):
-        try:
-            yield
-        except self._connection_errors:
             try:
-                self._ensure(self._reconnect_pubsub, ())
-            except self._connection_errors:
-                logger.critical(E_RETRY_LIMIT_EXCEEDED)
-                raise
+                with Mutex(
+                    client,
+                    self.unacked_mutex_key,
+                    self.unacked_mutex_expire,
+                ):
+                    env = _detect_environment()
+                    if env == 'gevent':
+                        ceil = time()
 
-    def _maybe_cancel_ready_task(self, meta):
-        if meta['status'] in states.READY_STATES:
-            self.cancel_for(meta['task_id'])
+                    visible = client.zrevrangebyscore(
+                        self.unacked_index_key,
+                        ceil,
+                        0,
+                        start=num and start,
+                        num=num,
+                        withscores=True
+                    )
 
-    def on_state_change(self, meta, message):
-        super().on_state_change(meta, message)
-        self._maybe_cancel_ready_task(meta)
-
-    def start(self, initial_task_id, **kwargs):
-        self._pubsub = self.backend.client.pubsub(
-            ignore_subscribe_messages=True,
-        )
-        self._consume_from(initial_task_id)
-
-    def on_wait_for_pending(self, result, **kwargs):
-        for meta in result._iter_meta(**kwargs):
-            if meta is not None:
-                self.on_state_change(meta, None)
-
-    def stop(self):
-        if self._pubsub is not None:
-            self._pubsub.close()
-
-    def drain_events(self, timeout=None):
-        if self._pubsub:
-            with self.reconnect_on_error():
-                message = self._pubsub.get_message(timeout=timeout)
-                if message and message['type'] == 'message':
-                    self.on_state_change(self._decode_result(message['data']), message)
-        elif timeout:
-            time.sleep(timeout)
-
-    def consume_from(self, task_id):
-        if self._pubsub is None:
-            return self.start(task_id)
-        self._consume_from(task_id)
-
-    def _consume_from(self, task_id):
-        key = self._get_key_for_task(task_id)
-        if key not in self.subscribed_to:
-            self.subscribed_to.add(key)
-            with self.reconnect_on_error():
-                self._pubsub.subscribe(key)
-
-    def cancel_for(self, task_id):
-        key = self._get_key_for_task(task_id)
-        self.subscribed_to.discard(key)
-        if self._pubsub:
-            with self.reconnect_on_error():
-                self._pubsub.unsubscribe(key)
+                    for tag, score in visible or []:
+                        self.restore_by_tag(tag, client)
+            except MutexHeld:
+                pass
 
 
-# Code mostly implemented from celery.backends.redis
-class RedisClusterBackend(KeyValueStoreBackend):
-    """Redis task result store."""
+class ClusterPoller(MultiChannelPoller):
 
-    ResultConsumer = ResultConsumer
+    def __init__(self):
+        self.conn_to_node_brpop = {}
+        self.conn_to_node_listen = {}
 
-    #: redis client module.
-    redis = RedisCluster
-    connection_class_ssl = connection.SSLConnection if redis else None
+        super().__init__()
 
-    startup_nodes = None
-    max_connections = None
-    init_slot_cache = True
+    def _register(self, channel, client, conn, cmd):
+        ident = (channel, client, conn, cmd)
 
-    supports_autoexpire = True
-    supports_native_join = True
-    implements_incr = True
+        if ident in self._chan_to_sock:
+            self._unregister(*ident)
 
-    def __init__(self, host=None, port=None, password=None,
-                 max_connections=None, url=None, **kwargs):
-        super().__init__(expires_type=int, **kwargs)
+        if conn._sock is None:
+            conn.connect()
 
-        if self.redis is None:
-            raise ImproperlyConfigured(E_REDIS_MISSING)
+        sock = conn._sock
+        self._fd_to_chan[sock.fileno()] = (channel, conn, cmd)
+        self._chan_to_sock[ident] = sock
+        self.poller.register(sock, self.eventflags)
 
-        self.initialize_parameters(host, port, password, max_connections, url)
+    def _unregister(self, channel, client, conn, cmd):
+        sock = self._chan_to_sock[(channel, client, conn, cmd)]
+        self.poller.unregister(sock)
 
-        # If we've received SSL parameters via query string or the
-        # redis_backend_use_ssl dict, check ssl_cert_reqs is valid. If set
-        # via query string ssl_cert_reqs will be a string so convert it here
-        if ('connection_class' in self.connparams
-                and issubclass(self.connparams['connection_class'], connection.SSLConnection)):
-            ssl_cert_reqs_missing = 'MISSING'
-            ssl_string_to_constant = {'CERT_REQUIRED': CERT_REQUIRED,
-                                      'CERT_OPTIONAL': CERT_OPTIONAL,
-                                      'CERT_NONE': CERT_NONE,
-                                      'required': CERT_REQUIRED,
-                                      'optional': CERT_OPTIONAL,
-                                      'none': CERT_NONE}
-            ssl_cert_reqs = self.connparams.get('ssl_cert_reqs', ssl_cert_reqs_missing)
-            ssl_cert_reqs = ssl_string_to_constant.get(ssl_cert_reqs, ssl_cert_reqs)
-            if ssl_cert_reqs not in ssl_string_to_constant.values():
-                raise ValueError(E_REDIS_SSL_CERT_REQS_MISSING_INVALID)
+    def _register_BRPOP(self, channel):
+        conns = self._get_conns_for_channel(channel)
+        for conn in conns:
+            ident = (channel, channel.client, conn, 'BRPOP')
 
-            if ssl_cert_reqs == CERT_OPTIONAL:
-                logger.warning(W_REDIS_SSL_CERT_OPTIONAL)
-            elif ssl_cert_reqs == CERT_NONE:
-                logger.warning(W_REDIS_SSL_CERT_NONE)
-            self.connparams['ssl_cert_reqs'] = ssl_cert_reqs
+            if (conn._sock is None or ident not in self._chan_to_sock):
+                channel._in_poll = False
+                self._register(*ident)
 
-        if self.connparams is not None and not isinstance(self.connparams, dict):
-            raise ImproperlyConfigured(
-                'RedisCluster backend settings should be grouped in a dict')
+        if not channel._in_poll:  # send BRPOP
+            channel._brpop_start()
 
+    def _register_LISTEN(self, channel):
+        conns = self._get_fanout_conns_for_channel(channel)
+
+        for conn in conns:
+            ident = (channel, channel.subclient, conn, 'LISTEN')
+
+            if (conn._sock is None or ident not in self._chan_to_sock):
+                channel._in_listen = False
+                node = self.conn_to_node_listen[(conn.host, conn.port)]
+                channel.subclient.set_pubsub_node(channel.client, node)
+                channel.subclient.connection = conn
+                self._register(*ident)
+
+        if not channel._in_listen:
+            channel._subscribe()  # send SUBSCRIBE
+
+    def _get_conns_for_channel(self, channel):
+        all_conn = []
+        if self._chan_to_sock and self.conn_to_node_brpop:
+            return [conn for _, _, conn, cmd in self._chan_to_sock if cmd == "BRPOP"]
+
+        for key in channel.active_queues:
+            node = channel.client.get_node_from_key(key)
+            redis_node = channel.client.get_redis_connection(node)
+            conn = redis_node.connection_pool.get_connection(key, 'NOOP')
+            if (conn.host, conn.port) not in self.conn_to_node_brpop:
+                all_conn.append(conn)
+                self.conn_to_node_brpop[(conn.host, conn.port)] = node
+        return all_conn
+
+    def _get_fanout_conns_for_channel(self, channel):
+        all_conn = []
+        if self._chan_to_sock and self.conn_to_node_listen:
+            return [conn for _, _, conn, cmd in self._chan_to_sock if cmd == "LISTEN"]
+
+        for key in channel.active_fanout_queues:
+            node = channel.client.get_node_from_key(key)
+            channel.subclient.set_pubsub_node(channel.client, node)
+            redis_node = channel.subclient.get_redis_connection()
+            conn = redis_node.connection_pool.get_connection(key, 'NOOP')
+            if (conn.host, conn.port) not in self.conn_to_node_listen:
+                all_conn.append(conn)
+                self.conn_to_node_listen[(conn.host, conn.port)] = node
+        return all_conn
+
+    def handle_event(self, fileno, event):
+        if event & READ:
+            return self.on_readable(fileno), self
+        elif event & ERR:
+            chan, conn, cmd = self._fd_to_chan[fileno]
+            options = {'connection': conn}
+            chan._poll_error(cmd, **options)
+
+    def on_readable(self, fileno):
         try:
-            new_join = strtobool(self.connparams.pop('new_join'))
-            if new_join:
-                self.apply_chord = self._new_chord_apply
-                self.on_chord_part_return = self._new_chord_return
-
+            chan, conn, cmd = self._fd_to_chan[fileno]
         except KeyError:
-            pass
-
-        self.expires = self.prepare_expires(None, type=int)
-        self.connection_errors, self.channel_errors = (
-            get_redis_error_classes() if get_redis_error_classes
-            else ((), ()))
-        self.result_consumer = self.ResultConsumer(
-            self, self.app, self.accept,
-            self._pending_results, self._pending_messages,
-        )
-
-    def initialize_parameters(self, host=None, port=None, password=None,
-                              max_connections=None, url=None, **kwargs):
-        _get = self.app.conf.get
-
-        if host and '://' in host:
-            url, host = host, None
-
-        self.max_connections = (
-            max_connections
-            or _get('redis_max_connections')
-            or self.max_connections)
-
-        retry_on_timeout = _get('redis_retry_on_timeout')
-        health_check_interval = _get('redis_backend_health_check_interval')
-        skip_full_coverage_check = _get('skip_full_coverage_check')
-
-        self.connparams = {
-            'host': _get('redis_host') or 'localhost',
-            'port': _get('redis_port') or 6379,
-            'password': _get('redis_password'),
-            'max_connections': self.max_connections,
-            'retry_on_timeout': retry_on_timeout or False,
-            'skip_full_coverage_check': skip_full_coverage_check or True
-        }
-
-        if health_check_interval:
-            self.connparams["health_check_interval"] = health_check_interval
-
-        # "redis_backend_use_ssl" must be a dict with the keys:
-        # 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile'
-        # (the same as "broker_use_ssl")
-        ssl = _get('redis_backend_use_ssl')
-        if ssl:
-            self.connparams.update(ssl)
-            self.connparams['connection_class'] = self.connection_class_ssl
-
-        self.recommended_cluster_alias = _get('recommended_cluster_alias') or ('cluster-redis', 'cluster-rediss')
-        self.other_cluster_alias = _get('other_cluster_alias') or ('redis', 'rediss')
-
-        if not url:
-            url = _get('redis_url')
-
-        if url:
-            self.connparams = self._params_from_url(url, self.connparams)
-
-        self.url = url
-
-    def get(self, key):
-        return self.client.get(key)
-
-    def mget(self, keys):
-        return self.client.mget(keys)
-
-    def ensure(self, fun, args, **policy):
-        retry_policy = dict(self.retry_policy, **policy)
-        max_retries = retry_policy.get('max_retries')
-        return retry_over_time(
-            fun, self.connection_errors, args, {},
-            partial(self.on_connection_error, max_retries),
-            **retry_policy
-        )
-
-    def on_task_call(self, producer, task_id):
-        if not task_join_will_block():
-            self.result_consumer.consume_from(task_id)
-
-    def on_connection_error(self, max_retries, exc, intervals, retries):
-        tts = next(intervals)
-        logger.error(
-            E_LOST.strip(),
-            retries, max_retries or 'Inf', humanize_seconds(tts, 'in '))
-        return tts
-
-    def set(self, key, value, **retry_policy):
-        return self.ensure(self._set, (key, value), **retry_policy)
-
-    def _set(self, key, value):
-        if hasattr(self, 'expires'):
-            self.client.setex(key, self.expires, value)
-        else:
-            self.client.set(key, value)
-
-    def forget(self, task_id):
-        super().forget(task_id)
-        self.result_consumer.cancel_for(task_id)
-
-    def delete(self, key):
-        self.client.delete(key)
-
-    def incr(self, key):
-        return self.client.incr(key)
-
-    def expire(self, key, value):
-        return self.client.expire(key, value)
-
-    def add_to_chord(self, group_id, result):
-        self.client.incr(self.get_key_for_group(group_id, '.t'), 1)
-
-    def _unpack_chord_result(self, tup, decode,
-                             EXCEPTION_STATES=states.EXCEPTION_STATES,
-                             PROPAGATE_STATES=states.PROPAGATE_STATES):
-        _, tid, state, retval = decode(tup)
-        if state in EXCEPTION_STATES:
-            retval = self.exception_to_python(retval)
-        if state in PROPAGATE_STATES:
-            raise ChordError('Dependency {0} raised {1!r}'.format(tid, retval))
-        return retval
-
-    def _new_chord_apply(self, header, partial_args, group_id, body,
-                         result=None, options=None, **kwargs):
-        # avoids saving the group in the redis db.
-        options = options or {}
-        options['task_id'] = group_id
-        return header(*partial_args, **options or {})
-
-    def _new_chord_return(self, task, state, result, propagate=None,
-                          PROPAGATE_STATES=states.PROPAGATE_STATES):
-        app = self.app
-        if propagate is None:
-            propagate = self.app.conf.CELERY_CHORD_PROPAGATES
-        request = task.request
-        tid, gid = request.id, request.group
-        if not gid or not tid:
             return
 
-        client = self.client
-        jkey = self.get_key_for_group(gid, '.j')
-        tkey = self.get_key_for_group(gid, '.t')
-        result = self.encode_result(result, state)
-        _, readycount, totaldiff, _, _ = client.pipeline()              \
-            .rpush(jkey, self.encode([1, tid, state, result]))          \
-            .llen(jkey)                                                 \
-            .get(tkey)                                                  \
-            .expire(jkey, 86400)                                        \
-            .expire(tkey, 86400)                                        \
-            .execute()
+        if chan.qos.can_consume():
+            if cmd == "BRPOP":
+                return chan.handlers[cmd](**{'conn': conn})
+            else:
+                return chan.handlers[cmd](**{'node': self.conn_to_node_listen[(conn.host, conn.port)]})
 
-        totaldiff = int(totaldiff or 0)
+
+class Channel(RedisChannel):
+
+    QoS = QoS
+    connection_class = Connection if rediscluster else None
+    connection_class_ssl = SSLConnection if rediscluster else None
+    socket_keepalive = True
+
+    namespace = 'default'
+    keyprefix_queue = '/{namespace}/_kombu/binding%s'
+    keyprefix_fanout = '/{namespace}/_kombu/fanout.'
+    unacked_key = '/{namespace}/_kombu/unacked'
+    unacked_index_key = '/{namespace}/_kombu/unacked_index'
+    unacked_mutex_key = '/{namespace}/_kombu/unacked_mutex'
+
+    min_priority = 0
+    max_priority = 0
+    priority_steps = [min_priority]
+
+    from_transport_options = RedisChannel.from_transport_options + (
+        'namespace',
+        'keyprefix_queue',
+        'keyprefix_fanout',
+    )
+
+    def __init__(self, conn, *args, **kwargs):
+        options = conn.client.transport_options
+        namespace = options.get('namespace', self.namespace)
+        self.brpop_conn = set()
+        self.listen_conn = set()
+        keys = [
+            'keyprefix_queue',
+            'keyprefix_fanout',
+            'unacked_key',
+            'unacked_index_key',
+            'unacked_mutex_key',
+        ]
+
+        for key in keys:
+            value = options.get(key, getattr(self, key))
+            options[key] = value.format(namespace=namespace)
+
+        super().__init__(conn, *args, **kwargs)
+        self.client.info()
+
+    def _get_client(self):
+        return rediscluster.RedisCluster
+
+    def _create_client(self, asynchronous=False):
+        params = self._connparams(asynchronous=asynchronous)
+        params.pop('connection_class', None)
+        if asynchronous:
+            return self.Client(**params)
+        return self.Client(**params)
+
+    def _subscribe(self):
+        keys = [self._get_subscribe_topic(queue)
+                for queue in self.active_fanout_queues]
+        if not keys:
+            return
+        c = self.subclient
+        if keys:
+            c.psubscribe(keys)
+            self._in_listen = c.get_redis_connection().connection_pool.get_connection(keys[0], 'NOOP')
+
+    def _receive(self, **options):
+        ret = []
+        node = options.pop('node')
+        c = self.subclient
+        c.set_pubsub_node(self.client, node)
+        self.listen_conn.add(c.get_redis_connection())
+        try:
+            ret.append(self._receive_one(c))
+        except Empty:
+            pass
+        while c.connection is not None and c.connection.can_read(timeout=0):
+            ret.append(self._receive_one(c))
+        return any(ret)
+
+    def _brpop_start(self, timeout=1):
+        queues = self._queue_cycle.consume(len(self.active_queues))
+        if not queues:
+            return
+
+        self._in_poll = True
+        timeout = timeout or 0
+        node_to_keys = {}
+
+        for key in queues:
+            node = self.client.get_node_from_key(key)
+            node_to_keys.setdefault(node.name, []).append(key)
+
+        for chan, client, conn, cmd in self.connection.cycle._chan_to_sock:
+            expected = (self, self.client, 'BRPOP')
+            node_name = rediscluster.get_node_name(host=conn.host,
+                                                   port=conn.port)
+            keys = node_to_keys.get(node_name)
+            if keys and (chan, client, cmd) == expected:
+                for key in keys:
+                    conn.send_command('BRPOP', key, timeout)
+
+    def _brpop_read(self, **options):
+        client = self.client
 
         try:
-            callback = maybe_signature(request.chord, app=app)
-            total = callback['chord_size'] + totaldiff
-            if readycount == total:
-                decode, unpack = self.decode, self._unpack_chord_result
-                resl, _, _ = client.pipeline()  \
-                    .lrange(jkey, 0, total)     \
-                    .delete(jkey)               \
-                    .delete(tkey)               \
-                    .execute()
-                try:
-                    callback.delay([unpack(tup, decode) for tup in resl])
-                except Exception as exc:
-                    error('Chord callback for %r raised: %r',
-                          request.group, exc, exc_info=1)
-                    app._tasks[callback.task].backend.fail_from_current_stack(
-                        callback.id,
-                        exc=ChordError('Callback error: {0!r}'.format(exc)),
-                    )
-        except ChordError as exc:
-            error('Chord %r raised: %r', request.group, exc, exc_info=1)
-            app._tasks[callback.task].backend.fail_from_current_stack(
-                callback.id, exc=exc,
-            )
-        except Exception as exc:
-            error('Chord %r raised: %r', request.group, exc, exc_info=1)
-            app._tasks[callback.task].backend.fail_from_current_stack(
-                callback.id, exc=ChordError('Join error: {0!r}'.format(exc)),
-            )
+            conn = options.pop('conn')
+            node = client.get_node(conn.host, conn.port)
+            self.brpop_conn.add(conn)
+            try:
+                resp = node.redis_connection.parse_response(conn, 'BRPOP', **options)
+            except self.connection_errors:
+                conn.disconnect()
+                raise
+            except MovedError as e:
+                # copied from rediscluster/client.py
+                client.reinitialize_counter += 1
+                if client._should_reinitialized():
+                    client.nodes_manager.initialize()
+                    # Reset the counter
+                    client.reinitialize_counter = 0
+                else:
+                    self.nodes_manager.update_moved_exception(e)
+                raise Empty()
 
-    def _params_from_url(self, url, defaults):
-        scheme, host, port, username, password, path, query = _parse_url(url)
-        connparams = dict(
-            defaults, **dictfilter({
-                'host': host, 'port': port, 'username': username,
-                'password': password})
+            if resp:
+                dest, item = resp
+                dest = bytes_to_str(dest).rsplit(self.sep, 1)[0]
+                self._queue_cycle.rotate(dest)
+                self.connection._deliver(loads(bytes_to_str(item)), dest)
+                return True
+            else:
+                raise Empty()
+        finally:
+            self._in_poll = False
+
+    def _poll_error(self, type, **options):
+        if type == 'LISTEN':
+            self.subclient.parse_response()
+        else:
+            self.client.parse_response(options.pop('connection'), type)
+
+    def _close_clients(self):
+        # Close connections
+        for conn in self.brpop_conn:
+            try:
+                conn.disconnect()
+            except (KeyError, AttributeError, self.ResponseError):
+                pass
+
+        for conn in self.listen_conn:
+            try:
+                conn.disconnect()
+            except (KeyError, AttributeError, self.ResponseError):
+                pass
+
+    def _connparams(self, asynchronous=False):
+        conninfo = self.connection.client
+        connparams = {
+            'host': conninfo.hostname or '127.0.0.1',
+            'port': conninfo.port or self.connection.default_port,
+            'virtual_host': conninfo.virtual_host,
+            'username': conninfo.userid,
+            'password': conninfo.password,
+            'max_connections': self.max_connections,
+            'socket_timeout': self.socket_timeout,
+            'socket_connect_timeout': self.socket_connect_timeout,
+            'socket_keepalive': self.socket_keepalive,
+            'socket_keepalive_options': self.socket_keepalive_options,
+            'health_check_interval': self.health_check_interval,
+            'retry_on_timeout': self.retry_on_timeout,
+        }
+
+        conn_class = self.connection_class
+
+        # If the connection class does not support the `health_check_interval`
+        # argument then remove it.
+        if (
+            hasattr(conn_class, '__init__')
+                and not accepts_argument(conn_class.__init__, 'health_check_interval')):
+            connparams.pop('health_check_interval')
+
+        if conninfo.ssl:
+            # Connection(ssl={}) must be a dict containing the keys:
+            # 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile'
+            try:
+                connparams.update({'ssl': True})
+                connparams.update(conninfo.ssl)
+                connparams['connection_class'] = self.connection_class_ssl
+            except TypeError:
+                pass
+        host = connparams['host']
+        if '://' in host:
+            scheme, _, _, username, password, path, query = _parse_url(host)
+            if scheme == 'socket':
+                connparams = self._filter_tcp_connparams(**connparams)
+                connparams.update({
+                    'connection_class': redis.UnixDomainSocketConnection,
+                    'path': '/' + path}, **query)
+
+                connparams.pop('socket_connect_timeout', None)
+                connparams.pop('socket_keepalive', None)
+                connparams.pop('socket_keepalive_options', None)
+            connparams['username'] = username
+            connparams['password'] = password
+
+            connparams.pop('host', None)
+            connparams.pop('port', None)
+
+        channel = self
+        connection_cls = (
+            connparams.get('connection_class')
+            or self.connection_class
         )
 
-        ssl_param_keys = ['ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile',
-                          'ssl_cert_reqs']
+        if asynchronous:
+            class Connection(connection_cls):
+                def disconnect(self):
+                    super().disconnect()
+                    channel._on_connection_disconnect(self)
+            connection_cls = Connection
 
-        if scheme == self.recommended_cluster_alias[0] or scheme == self.other_cluster_alias[0]:
-            # If connparams or query string contain ssl params, raise error
-            if (any(key in connparams for key in ssl_param_keys)
-                    or any(key in query for key in ssl_param_keys)):
-                raise ValueError(E_REDIS_SSL_PARAMS_AND_SCHEME_MISMATCH)
-
-        if scheme == self.recommended_cluster_alias[1] or scheme == self.other_cluster_alias[1]:
-            connparams['connection_class'] = connection.SSLConnection
-            connparams['ssl'] = True
-            # The following parameters, if present in the URL, are encoded. We
-            # must add the decoded values to connparams.
-            for ssl_setting in ssl_param_keys:
-                ssl_val = query.pop(ssl_setting, None)
-                if ssl_val:
-                    connparams[ssl_setting] = unquote(ssl_val)
+        connparams['connection_class'] = connection_cls
 
         return connparams
 
-    @cached_property
-    def client(self):
-        self.connparams.pop('connection_class', None)
-        return RedisCluster(**self.connparams)
+
+class RedisClusterTransport(RedisTransport):
+
+    Channel = Channel
+
+    driver_type = 'cluster-redis'
+    driver_name = driver_type
+
+    def __init__(self, *args, **kwargs):
+        if rediscluster is None:
+            raise ImportError('dependency missing: redis-py')
+
+        super().__init__(*args, **kwargs)
+        self.cycle = ClusterPoller()
+
+    def driver_version(self):
+        return redis.__version__
